@@ -1,0 +1,29 @@
+node_modules/
+dist/
+build/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Prisma generated client
+apps/api/src/generated/
+
+# Storage (runtime data, keep structure only)
+storage/media/images/*
+storage/media/videos/*
+storage/media/audio/*
+storage/media/documents/*
+storage/avatars/*
+storage/imports/*
+storage/exports/*
+!storage/**/.gitkeep
+
+# WhatsApp session auth data (sensitive)
+storage/wa-sessions/
+
+# Editors / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db

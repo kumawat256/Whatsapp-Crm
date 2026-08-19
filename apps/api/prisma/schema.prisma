@@ -1,0 +1,664 @@
+// Prisma schema — grows phase by phase.
+// Phase 2: Users, Roles, Permissions, RefreshToken (Auth + RBAC).
+// Phase 3: full data model. Business logic for each domain lands in its
+// own phase (Contacts/Lists, Inbox/Messages/Media, Templates,
+// Campaigns, Credits, Automations, Audit logs, Settings) — this phase is
+// persistence only.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+// ---------------------------------------------------------------------------
+// Auth & RBAC
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  firstName    String
+  lastName     String
+  avatarUrl    String?
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  roleId String
+  role   Role   @relation(fields: [roleId], references: [id])
+
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+
+  refreshTokens         RefreshToken[]
+  createdTemplates      Template[]          @relation("TemplateCreatedBy")
+  createdCampaigns      Campaign[]          @relation("CampaignCreatedBy")
+  createdAutomations    Automation[]        @relation("AutomationCreatedBy")
+  sentMessages          Message[]           @relation("MessageSentBy")
+  uploadedMedia         Media[]             @relation("MediaUploadedBy")
+  assignedConversations Conversation[]      @relation("ConversationAssignedTo")
+  creditTransactions    CreditTransaction[] @relation("CreditTransactionCreatedBy")
+  notifications         Notification[]
+  auditLogs             AuditLog[]
+  updatedSettings       SystemSetting[]
+
+  @@index([roleId])
+  @@index([organizationId])
+}
+
+model Role {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String?
+  isSystem    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  users       User[]
+  permissions Permission[] @relation("RolePermissions")
+}
+
+model Permission {
+  id          String  @id @default(cuid())
+  key         String  @unique
+  description String?
+
+  roles Role[] @relation("RolePermissions")
+}
+
+// id doubles as the refresh JWT's `jti` claim, so a row lookup by id is
+// enough to validate/revoke a token — no need to store the token itself.
+model RefreshToken {
+  id        String    @id @default(cuid())
+  userAgent String?
+  ipAddress String?
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Organizations
+// ---------------------------------------------------------------------------
+
+enum OrganizationStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+// Doubles as "Customer" in the multi-tenant SaaS model: Super Admin creates
+// one Organization per customer, with its own Customer Admin, wallet, and
+// data. Every tenant-owned model below requires organizationId — User is
+// the one exception (nullable: Super Admin users aren't scoped to any org).
+model Organization {
+  id             String             @id @default(cuid())
+  name           String
+  status         OrganizationStatus @default(ACTIVE)
+  serviceEnabled Boolean            @default(true)
+  // Per-module on/off switches, e.g. {"campaigns": false}. A module missing
+  // from this map (including a null/empty map) is treated as enabled — so
+  // every pre-existing organization defaults to "everything on" with no
+  // backfill needed.
+  enabledModules Json?
+  // Campaign sending is batched, not per-recipient-random: send
+  // campaignBatchSize recipients at once, then wait a random interval in
+  // [campaignBatchIntervalMinSeconds, campaignBatchIntervalMaxSeconds]
+  // before the next batch. Configured per-org (by that org's own Admin) so
+  // each customer can tune it to their own WhatsApp account's risk
+  // tolerance — this is deliberately not a per-campaign setting.
+  campaignBatchSize               Int @default(5)
+  campaignBatchIntervalMinSeconds Int @default(5)
+  campaignBatchIntervalMaxSeconds Int @default(10)
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  planId String?
+  plan   Plan?   @relation(fields: [planId], references: [id])
+  // Computed on plan assign/change from Plan.durationDays — null means
+  // either no plan or the plan has no expiry. Checked before every WhatsApp
+  // send (see ConversationsService.sendMessage) so a lapsed plan silently
+  // stops new sends without touching anything else the org can do.
+  planExpiresAt DateTime?
+
+  users              User[]
+  whatsAppAccounts   WhatsAppAccount[]
+  contacts           Contact[]
+  lists              List[]
+  listMembers        ListMember[]
+  templates          Template[]
+  campaigns          Campaign[]
+  campaignRecipients CampaignRecipient[]
+  automations        Automation[]
+  conversations      Conversation[]
+  messages           Message[]
+  media              Media[]
+  creditWallet       CreditWallet?
+  creditTransactions CreditTransaction[]
+  auditLogs          AuditLog[]
+
+  @@index([status])
+}
+
+// No payment gateway yet — plans are metadata/limits only, assigned
+// manually by Super Admin at customer-creation or edit time.
+model Plan {
+  id                  String   @id @default(cuid())
+  name                String   @unique
+  credits             Int
+  maxWhatsAppAccounts Int
+  // Null = no expiry (unlimited/evergreen plan). When set, assigning this
+  // plan to an organization computes Organization.planExpiresAt as
+  // "assigned at + durationDays" — see OrganizationsService.
+  durationDays        Int?
+  isActive            Boolean  @default(true)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  organizations Organization[]
+}
+
+// ---------------------------------------------------------------------------
+// WhatsApp accounts & sessions
+// ---------------------------------------------------------------------------
+
+enum WhatsAppAccountStatus {
+  DISCONNECTED
+  CONNECTING
+  CONNECTED
+  LOGGED_OUT
+}
+
+model WhatsAppAccount {
+  id          String                @id @default(cuid())
+  label       String
+  phoneNumber String?
+  status      WhatsAppAccountStatus @default(DISCONNECTED)
+  connectedAt DateTime?
+  lastSeenAt  DateTime?
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  sessions      WhatsAppSession[]
+  conversations Conversation[]
+  messages      Message[]
+  campaigns     Campaign[]
+
+  @@index([organizationId])
+}
+
+enum WhatsAppSessionStatus {
+  ACTIVE
+  REVOKED
+  EXPIRED
+}
+
+model WhatsAppSession {
+  id          String                @id @default(cuid())
+  status      WhatsAppSessionStatus @default(ACTIVE)
+  // Provider auth/session state, encrypted at rest by the application layer.
+  sessionData String?               @db.Text
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
+  revokedAt   DateTime?
+
+  accountId String
+  account   WhatsAppAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([accountId])
+}
+
+// ---------------------------------------------------------------------------
+// Contacts, Lists
+// ---------------------------------------------------------------------------
+
+model Contact {
+  id          String    @id @default(cuid())
+  firstName   String
+  lastName    String?
+  phoneNumber String
+  avatarUrl   String?
+  notes       String?   @db.Text
+  source      String?
+  isOptedOut  Boolean   @default(false)
+  optedOutAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  lists              ListMember[]
+  conversations      Conversation[]
+  campaignRecipients CampaignRecipient[]
+
+  // Scoped per organization, not globally: two different customers'
+  // businesses may legitimately have a contact with the same phone number.
+  @@unique([organizationId, phoneNumber])
+  @@index([organizationId])
+  @@index([isOptedOut])
+}
+
+model List {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  members ListMember[]
+
+  @@index([organizationId])
+}
+
+model ListMember {
+  id      String   @id @default(cuid())
+  addedAt DateTime @default(now())
+
+  listId String
+  list   List   @relation(fields: [listId], references: [id], onDelete: Cascade)
+
+  contactId String
+  contact   Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  // Denormalized from the parent List so the tenant-scoping Prisma
+  // extension can enforce isolation directly on this table too.
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  @@unique([listId, contactId])
+  @@index([contactId])
+  @@index([organizationId])
+}
+
+// ---------------------------------------------------------------------------
+// Conversations, Messages, Media
+// ---------------------------------------------------------------------------
+
+model Conversation {
+  id            String    @id @default(cuid())
+  unreadCount   Int       @default(0)
+  lastMessageAt DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  whatsAppAccountId String
+  whatsAppAccount   WhatsAppAccount @relation(fields: [whatsAppAccountId], references: [id], onDelete: Cascade)
+
+  contactId String
+  contact   Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  assignedToUserId String?
+  assignedTo       User?   @relation("ConversationAssignedTo", fields: [assignedToUserId], references: [id])
+
+  // Denormalized from the parent WhatsAppAccount for direct tenant scoping.
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  messages Message[]
+
+  @@unique([whatsAppAccountId, contactId])
+  @@index([contactId])
+  @@index([assignedToUserId])
+  @@index([lastMessageAt])
+  @@index([organizationId])
+}
+
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum MessageType {
+  TEXT
+  IMAGE
+  VIDEO
+  AUDIO
+  DOCUMENT
+  TEMPLATE
+}
+
+enum MessageStatus {
+  PENDING
+  SENT
+  DELIVERED
+  READ
+  FAILED
+}
+
+model Message {
+  id           String           @id @default(cuid())
+  direction    MessageDirection
+  type         MessageType
+  content      String?          @db.Text
+  status       MessageStatus    @default(PENDING)
+  waMessageId  String?
+  errorMessage String?
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  whatsAppAccountId String
+  whatsAppAccount   WhatsAppAccount @relation(fields: [whatsAppAccountId], references: [id])
+
+  mediaId String?
+  media   Media?  @relation(fields: [mediaId], references: [id])
+
+  sentByUserId String?
+  sentBy       User?   @relation("MessageSentBy", fields: [sentByUserId], references: [id])
+
+  // Denormalized from the parent Conversation/WhatsAppAccount.
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  campaignRecipient CampaignRecipient?
+
+  @@index([conversationId, createdAt])
+  @@index([whatsAppAccountId])
+  @@index([waMessageId])
+  @@index([organizationId])
+  // Dashboard/analytics filter by org + status (all-time counts) and by
+  // org + date range (trend charts) — the single [organizationId] index
+  // alone forces an in-memory filter over every message the org has ever
+  // sent for both of those.
+  @@index([organizationId, status])
+  @@index([organizationId, createdAt])
+}
+
+enum MediaType {
+  IMAGE
+  VIDEO
+  AUDIO
+  DOCUMENT
+}
+
+model Media {
+  id        String    @id @default(cuid())
+  type      MediaType
+  filePath  String
+  fileName  String
+  mimeType  String
+  sizeBytes Int
+  checksum  String?
+  createdAt DateTime  @default(now())
+
+  uploadedByUserId String?
+  uploadedBy       User?   @relation("MediaUploadedBy", fields: [uploadedByUserId], references: [id])
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  messages  Message[]
+  templates Template[]
+
+  @@index([uploadedByUserId])
+  @@index([organizationId])
+}
+
+// ---------------------------------------------------------------------------
+// Templates
+// ---------------------------------------------------------------------------
+
+model Template {
+  id        String   @id @default(cuid())
+  name      String
+  category  String?
+  body      String   @db.Text
+  variables Json?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  mediaId String?
+  media   Media?  @relation(fields: [mediaId], references: [id])
+
+  createdByUserId String?
+  createdBy       User?   @relation("TemplateCreatedBy", fields: [createdByUserId], references: [id])
+
+  campaigns Campaign[]
+
+  @@index([organizationId])
+}
+
+// ---------------------------------------------------------------------------
+// Campaigns
+// ---------------------------------------------------------------------------
+
+enum CampaignStatus {
+  DRAFT
+  SCHEDULED
+  RUNNING
+  PAUSED
+  COMPLETED
+  CANCELLED
+  FAILED
+}
+
+model Campaign {
+  id              String         @id @default(cuid())
+  name            String
+  status          CampaignStatus @default(DRAFT)
+  scheduledAt     DateTime?
+  startedAt       DateTime?
+  completedAt     DateTime?
+  minDelaySeconds Int            @default(5)
+  maxDelaySeconds Int            @default(15)
+  dailyLimit      Int?
+  concurrency     Int            @default(1)
+  retryLimit      Int            @default(2)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  templateId String
+  template   Template @relation(fields: [templateId], references: [id])
+
+  whatsAppAccountId String
+  whatsAppAccount   WhatsAppAccount @relation(fields: [whatsAppAccountId], references: [id])
+
+  createdByUserId String?
+  createdBy       User?   @relation("CampaignCreatedBy", fields: [createdByUserId], references: [id])
+
+  recipients CampaignRecipient[]
+
+  @@index([organizationId])
+  @@index([status])
+}
+
+enum CampaignRecipientStatus {
+  PENDING
+  QUEUED
+  SENDING
+  SENT
+  DELIVERED
+  READ
+  FAILED
+  SKIPPED_OPTOUT
+  CANCELLED
+}
+
+model CampaignRecipient {
+  id           String                  @id @default(cuid())
+  status       CampaignRecipientStatus @default(PENDING)
+  attempts     Int                     @default(0)
+  errorMessage String?
+  scheduledFor DateTime?
+  sentAt       DateTime?
+  createdAt    DateTime                @default(now())
+  updatedAt    DateTime                @updatedAt
+
+  campaignId String
+  campaign   Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  contactId String
+  contact   Contact @relation(fields: [contactId], references: [id])
+
+  messageId String?  @unique
+  message   Message? @relation(fields: [messageId], references: [id])
+
+  // Denormalized from the parent Campaign.
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  @@unique([campaignId, contactId])
+  @@index([campaignId, status])
+  @@index([organizationId])
+}
+
+// ---------------------------------------------------------------------------
+// Credits
+// ---------------------------------------------------------------------------
+
+// One wallet per organization. Balance is only ever changed via
+// CreditTransaction inside a DB transaction — never written directly.
+model CreditWallet {
+  id        String   @id @default(cuid())
+  balance   Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organizationId String       @unique
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  transactions CreditTransaction[]
+}
+
+enum CreditTransactionType {
+  CREDIT
+  DEBIT
+}
+
+model CreditTransaction {
+  id            String                @id @default(cuid())
+  type          CreditTransactionType
+  amount        Int
+  reason        String
+  referenceType String?
+  referenceId   String?
+  balanceAfter  Int
+  createdAt     DateTime              @default(now())
+
+  walletId String
+  wallet   CreditWallet @relation(fields: [walletId], references: [id])
+
+  createdByUserId String?
+  createdBy       User?   @relation("CreditTransactionCreatedBy", fields: [createdByUserId], references: [id])
+
+  // Denormalized from the wallet so per-org usage reports don't need a join.
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([walletId, createdAt])
+  @@index([organizationId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Automations
+// ---------------------------------------------------------------------------
+
+model Automation {
+  id            String   @id @default(cuid())
+  name          String
+  triggerType   String
+  triggerConfig Json
+  actionType    String
+  actionConfig  Json
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  createdByUserId String?
+  createdBy       User?   @relation("AutomationCreatedBy", fields: [createdByUserId], references: [id])
+
+  @@index([organizationId])
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+model Notification {
+  id        String   @id @default(cuid())
+  type      String
+  title     String
+  body      String?
+  link      String?
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isRead])
+}
+
+// ---------------------------------------------------------------------------
+// Audit logs
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  action     String
+  entityType String?
+  entityId   String?
+  metadata   Json?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id])
+
+  // Denormalized snapshot of the actor's role name at the time of the
+  // action (e.g. "Super Admin"), so the audit UI can display/filter by
+  // actor type without joining through User -> Role.
+  actorRole String?
+
+  // Intentionally nullable long-term, not just for migration: a pure
+  // platform-level Super Admin action (e.g. creating a Plan) has no single
+  // customer to attribute it to.
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+
+  @@index([userId])
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@index([organizationId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// System settings
+// ---------------------------------------------------------------------------
+
+model SystemSetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  updatedByUserId String?
+  updatedBy       User?   @relation(fields: [updatedByUserId], references: [id])
+}
