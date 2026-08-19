@@ -32,7 +32,33 @@ Prerequisites already running on this machine:
 No Redis or other external queue/cache service is needed — the campaign
 engine (Phase 8) polls MySQL directly.
 
-Setup:
+### One-command setup
+
+With MySQL already running and reachable (an empty `whatsapp_crm` database
+doesn't need to exist yet — the migration step creates it):
+
+```bash
+pnpm setup
+```
+
+This installs every workspace's dependencies, creates `.env` and
+`apps/api/.env` from their `.env.example` (with freshly generated JWT/session
+secrets — never the example's placeholder values) if they don't already
+exist, applies all Prisma migrations, and seeds roles/permissions + the
+initial Super Admin login. Safe to re-run any time — existing `.env` files
+are left untouched and the seed step is idempotent.
+
+Then start both dev servers (two terminals):
+
+```bash
+pnpm dev:api   # http://localhost:3000  (health check: /health)
+pnpm dev:web   # http://localhost:5174
+```
+
+### Manual setup
+
+If you'd rather run each step yourself (e.g. to point `DATABASE_URL` at a
+non-default MySQL setup before installing):
 
 ```bash
 pnpm install
